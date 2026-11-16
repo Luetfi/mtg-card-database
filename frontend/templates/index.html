@@ -1,46 +1,7 @@
-<!DOCTYPE html>
-<html lang="de">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>MTG Card Search</title>
-    <style>
-        :root { --ink: #1c1b22; --muted: #6b6975; --line: #dedbe6; --paper: #f6f4f9; --card: #ffffff; --accent: #1f8a4c; }
-        * { box-sizing: border-box; }
-        body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; color: var(--ink); background: var(--paper); }
-        main { max-width: 1000px; margin: 0 auto; padding: 32px 16px 64px; }
-        h1 { margin: 0 0 4px; font-size: 28px; }
-        .stats { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
-        form { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px; }
-        input[type=text] { flex: 1 1 260px; padding: 10px 12px; font-size: 16px; border: 1px solid var(--ink); border-radius: 4px; }
-        select { padding: 10px 12px; font-size: 16px; border: 1px solid var(--line); border-radius: 4px; background: var(--card); }
-        button { padding: 10px 24px; font-size: 16px; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 4px; cursor: pointer; }
-        .summary { margin: 0 0 12px; color: var(--muted); }
-        .error { padding: 12px; background: #fde8e8; border: 1px solid #f0b4b4; border-radius: 4px; }
-        table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); }
-        th { text-align: left; padding: 10px 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); border-bottom: 1px solid var(--line); }
-        td { padding: 12px; vertical-align: top; border-bottom: 1px solid var(--line); }
-        td.image { width: 124px; }
-        td.image img { width: 100px; border-radius: 5px; display: block; }
-        .noimage { width: 100px; height: 140px; display: flex; align-items: center; justify-content: center; text-align: center; font-size: 12px; color: var(--muted); border: 1px dashed var(--line); border-radius: 5px; }
-        .name { font-weight: 600; font-size: 17px; }
-        .meta { color: var(--muted); font-size: 14px; margin-top: 2px; }
-        .text { margin-top: 8px; font-size: 14px; white-space: pre-line; }
-        td.id { white-space: nowrap; font-variant-numeric: tabular-nums; }
-        nav { display: flex; justify-content: space-between; margin-top: 16px; }
-        a { color: var(--accent); }
-        @media (max-width: 600px) { th.artist, td.artist { display: none; } td.image { width: 84px; } td.image img, .noimage { width: 68px; } .noimage { height: 95px; } }
-    </style>
-</head>
-<body>
-<main>
-    <h1>Search Cards</h1>
-    <p class="stats">
-        {% if stats and stats.cards %}{{ stats.cards }} Karten in der Datenbank, Stand {{ stats.load_date }}{% else %}Die Datenbank ist noch leer.{% endif %}
-    </p>
-
+{% extends "base.html" %}
+{% block content %}
     <form method="get" action="/">
-        <input type="text" name="q" value="{{ query }}" placeholder="z. B. Manta" autofocus>
+        <input type="text" name="q" value="{{ query }}" placeholder="z. B. Manta" maxlength="100" autofocus>
         <select name="field">
             {% for key, label in fields.items() %}
             <option value="{{ key }}" {% if key == field %}selected{% endif %}>{{ label }}</option>
@@ -66,9 +27,10 @@
                 {% else %}<div class="noimage">kein Bild</div>{% endif %}
             </td>
             <td>
-                <div class="name">{{ card.name }}</div>
+                <div class="name"><a href="{{ url_for('card', card_id=card.id) }}">{{ card.name }}</a></div>
+                {% if card.name_de %}<div class="meta">Deutsch: {{ card.name_de }}</div>{% endif %}
                 {% if card.foreign_name %}<div class="meta">auch: {{ card.foreign_name }}</div>{% endif %}
-                <div class="meta">{{ card.type or '' }}{% if card.mana_cost %} · {{ card.mana_cost }}{% endif %}</div>
+                <div class="meta">{{ card.type or '' }}{% if card.mana_cost %} · {{ card.mana_cost }}{% endif %}{% if card.color_names %} · {{ card.color_names|replace(',', ', ') }}{% endif %}</div>
                 <div class="meta">{{ card.set_name or '' }}{% if card.rarity %} · {{ card.rarity }}{% endif %}{% if card.printings_count > 1 %} · {{ card.printings_count }} Drucke{% endif %}</div>
                 {% if card.text %}<div class="text">{{ card.text }}</div>{% endif %}
             </td>
@@ -84,6 +46,4 @@
     </nav>
     {% endif %}
     {% endif %}
-</main>
-</body>
-</html>
+{% endblock %}

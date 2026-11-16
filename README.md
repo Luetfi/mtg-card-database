@@ -18,7 +18,10 @@ HDFS raw:   /user/hadoop/mtg/raw/YYYY/MM/DD/*.json      (unveränderte API-Antwo
         v
 HDFS final: /user/hadoop/mtg/final/cards                (Parquet, Hive-Tabelle mtg_cards)
             /user/hadoop/mtg/final/foreign_names        (Parquet, Hive-Tabelle mtg_foreign_names)
-        |  PySpark: pyspark_mtg_final_to_mysql.py (JDBC)
+        |  PySpark: pyspark_mtg_final_to_mysql.py (Anreicherung, JDBC)
+        v
+MySQL (Datenbank mtg): cards_staging, foreign_names_staging
+        |  Prüfung + RENAME TABLE (atomarer Tausch)
         v
 MySQL (Datenbank mtg): cards, foreign_names
         |  SQL
@@ -61,15 +64,53 @@ Datei: [airflow/dags/mtg.py](airflow/dags/mtg.py). Der DAG läuft automatisch t�
 | 7 | `pyspark_raw_to_final` | `SparkSubmitOperator` | Überführt die Rohdaten in den Final Layer (siehe Business Rules). |
 | 8 | `create_hive_table_mtg_cards` | `HiveOperator` | Legt die externe Hive-Tabelle `mtg_cards` über dem Final Layer an. |
 | 9 | `create_hive_table_mtg_foreign_names` | `HiveOperator` | Legt die externe Hive-Tabelle `mtg_foreign_names` an. |
-| 10 | `create_mysql_tables` | `PythonOperator` | Legt die MySQL-Tabellen `cards` und `foreign_names` an, falls sie fehlen. |
-| 11 | `pyspark_final_to_mysql` | `SparkSubmitOperator` | Reichert die Daten an und exportiert sie nach MySQL. |
+| 10 | `prepare_mysql_tables` | `PythonOperator` | Legt `cards` und `foreign_names` an, falls sie fehlen, und erzeugt leere Staging-Tabellen `cards_staging` und `foreign_names_staging` aus denselben DDL-Dateien. |
+| 11 | `pyspark_final_to_mysql` | `SparkSubmitOperator` | Reichert die Daten an und lädt sie in die Staging-Tabellen. |
+| 12 | `publish_mysql_tables` | `PythonOperator` | Prüft die Staging-Tabellen und tauscht sie mit `RENAME TABLE` in einem Schritt gegen die Live-Tabellen. |
+| 13 | `cleanup_hdfs_raw` | `BashOperator` | Löscht alte Raw-Partitionen in HDFS, die neuesten 3 Tage bleiben. |
 
-Reihenfolge: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> (8 und 9 parallel) -> 10 -> 11.
+Reihenfolge: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> (8 und 9 parallel) -> 10 -> 11 -> 12 -> 13.
+
+![Graph View des DAGs MTG nach dem Volllauf vom 16.11.2026, alle Tasks erfolgreich](docs/dag_graph.png)
 
 Einstellungen in Airflow:
 - **Variable `mtg_max_pages`:** `0` lädt alle Seiten (Standard). Eine andere Zahl begrenzt den Abruf, z. B. `5` für einen schnellen Testlauf.
-- **Connection `mtg_mysql`:** Zugangsdaten der MySQL-Datenbank. Der DAG liest sie zur Laufzeit; im Code stehen keine Passwörter.
+- **Connection `mtg_mysql`:** Zugangsdaten der MySQL-Datenbank für die Python-Tasks. Der DAG liest sie zur Laufzeit; im Code stehen keine Passwörter.
+- **Datei `/home/airflow/airflow/mtg_mysql.env`:** Zugangsdaten für den Spark-Export, nur für den Benutzer `airflow` lesbar (legt `setup/deploy.sh` an). So steht das Passwort weder in der `spark-submit`-Kommandozeile noch in den Logs oder in der Airflow-Oberfläche.
 - **Connections `hdfs`, `spark`, `beeline`:** sind im Airflow-Image der Vorlesung bereits vorhanden.
+
+### Ergebnis eines Volllaufs (16.11.2026)
+
+Lauf `scheduled__2026-11-15T03:00:00` auf der Google-Cloud-VM (n2-highmem-4), alle Tasks erfolgreich:
+
+| Task | Dauer |
+|---|---|
+| `create_import_dir`, `clear_import_dir` | 2 s |
+| `download_mtg_cards` | 99 s |
+| `clear_hdfs_raw_partition_dir`, `mkdir_hdfs_raw_partition_dir` | 12 s |
+| `upload_raw_cards_to_hdfs` | 293 s |
+| `pyspark_raw_to_final` | 70 s |
+| `create_hive_table_mtg_cards`, `create_hive_table_mtg_foreign_names` | je 4 s (parallel) |
+| `prepare_mysql_tables` | 1 s |
+| `pyspark_final_to_mysql` | 82 s |
+| `publish_mysql_tables` | 2 s |
+| `cleanup_hdfs_raw` | 3 s |
+| **Summe der Taskdauern** | **ca. 9,5 min** |
+
+Den größten Anteil hat der Upload der 937 JSON-Dateien nach HDFS, nicht der API-Abruf (dank 4 paralleler Downloads).
+
+| Kennzahl | Wert |
+|---|---|
+| API-Seiten (Raw-Dateien) | 937 |
+| Karten (Drucke) in `cards` | 93.643 |
+| davon mit deutschem Namen (`name_de`) | 47.067 |
+| davon mit Bild (`has_image = 1`) | 63.808 |
+| davon mit Farbe (`color_names`) | 73.235 |
+| übersetzte Namen in `foreign_names` | 358.564 |
+| Raw Layer (JSON) | 351,3 MB |
+| Final Layer (Parquet, `cards` + `foreign_names`) | 37,3 MB, rund 10-mal kleiner als Raw |
+
+Stichproben im Frontend nach dem Lauf: „Manta“ (Kartenname) liefert 23 Treffer, darunter „Cloud Manta“ mit dem deutschen Namen „Wolkenmanta“. „weiss“ (alle Felder) liefert 116 Treffer, „aether“ (Kartenname) 214 Treffer.
 
 ## 4. Skripte
 
@@ -89,36 +130,54 @@ Einstellungen in Airflow:
 - **Übersetzungen:** `foreignNames` wird in eine eigene Tabelle ausgelagert (eine Zeile pro Karte und Sprache, Dubletten entfernt).
 - **Format:** Parquet, weil es spaltenorientiert und komprimiert ist und das Schema mitführt.
 
-### Business Rules Final -> MySQL
+### Business Rules Final -> MySQL (Anreicherung)
 
-- `has_image`: 1, wenn die Karte eine Bild-URL hat. Das Frontend zeigt Karten mit Bild zuerst.
-- `printings_count`: Anzahl der Drucke mit demselben Kartennamen.
-- `load_date`: Datum des Laufs.
-- Die Tabellen werden pro Lauf geleert und neu gefüllt (`TRUNCATE` und Insert). So bleibt die Tabellendefinition samt Indizes erhalten, und der Stand ist nach jedem Lauf vollständig und aktuell.
+| Spalte | Regel | Nutzen |
+|---|---|---|
+| `name_de` | deutscher Name aus `foreign_names` (`language = 'German'`) | Trefferliste zeigt z. B. „Wolkenmanta“ direkt an |
+| `color_names` | Farben auf Deutsch (`W` -> `Weiß`, `U` -> `Blau`, `B` -> `Schwarz`, `R` -> `Rot`, `G` -> `Grün`; die API liefert Kürzel, ältere Daten auch `White`, `Blue` ...) | Anzeige im Frontend |
+| `search_name` | englischer und deutscher Name, normalisiert | Namenssuche ohne Unterabfrage |
+| `search_all` | Name, deutscher Name, Text und Artist, normalisiert | Suche „in allen Feldern“ über eine Spalte |
+| `has_image` | 1, wenn die Karte eine Bild-URL hat | Karten mit Bild stehen vorne |
+| `printings_count` | Anzahl der Drucke mit demselben Kartennamen (Window über `name`) | Anzeige „n Drucke“ |
+| `load_date` | Datum des Laufs | Datenstand in der Fußzeile |
+
+**Normalisierung:** klein geschrieben, `ß` -> `ss`, `æ` -> `ae`, Akzente und Umlaute entfernt (`ä` -> `a`, `é` -> `e`). Das Frontend normalisiert die Eingabe mit denselben Regeln, deshalb finden „weiss“, „Weiß“ und „WEISS“ dieselben Karten und „aether“ findet „Æther“.
+
+**Laden ohne Ausfallzeit:**
+1. `prepare_mysql_tables` legt leere Staging-Tabellen aus denselben DDL-Dateien an (nur der Tabellenname bekommt `_staging`).
+2. Spark schreibt in die Staging-Tabellen. Die Live-Tabellen bleiben dabei unberührt, die Suche funktioniert weiter.
+3. `publish_mysql_tables` prüft: Staging ist nicht leer, und bei einem Volllauf hat sie höchstens 10 % weniger Karten als bisher. Das schützt davor, dass eine unvollständige Antwort der API die Datenbank leert. Testläufe (`mtg_max_pages > 0`) überspringen die Größenprüfung.
+4. `RENAME TABLE cards TO cards_old, cards_staging TO cards, ...` tauscht beide Tabellen in einem atomaren Schritt. Danach werden die alten Tabellen gelöscht. Schlägt eine Prüfung fehl, bleibt der alte Stand online.
 
 ## 5. Datenmodell
 
-**Raw Layer (HDFS):** `/user/hadoop/mtg/raw/YYYY/MM/DD/cards_page_NNNNN.json`. Unveränderte API-Antworten, partitioniert nach Ladedatum.
+**Raw Layer (HDFS):** `/user/hadoop/mtg/raw/YYYY/MM/DD/cards_page_NNNNN.json`. Unveränderte API-Antworten, partitioniert nach Ladedatum. Die letzten 3 Tage bleiben erhalten.
 
 **Final Layer (HDFS und Hive):**
 - [ddl/hive/mtg_cards.sql](ddl/hive/mtg_cards.sql): eine Zeile pro Kartendruck.
 - [ddl/hive/mtg_foreign_names.sql](ddl/hive/mtg_foreign_names.sql): eine Zeile pro Karte und Sprache.
 
 **Endnutzer-Datenbank (MySQL, Datenbank `mtg`):**
-- [ddl/mysql/cards.sql](ddl/mysql/cards.sql): Karten mit den Zusatzspalten `has_image`, `printings_count`, `load_date`. Primärschlüssel `id`, Indizes auf `name`, `artist`, `multiverse_id`.
-- [ddl/mysql/foreign_names.sql](ddl/mysql/foreign_names.sql): übersetzte Namen, Indizes auf `card_id` und `name`.
+- [ddl/mysql/cards.sql](ddl/mysql/cards.sql): Karten mit den angereicherten Spalten (siehe oben). Primärschlüssel `id`, Indizes auf `name`, `artist`, `multiverse_id`.
+- [ddl/mysql/foreign_names.sql](ddl/mysql/foreign_names.sql): übersetzte Namen in allen Sprachen, Indizes auf `card_id` und `name`.
+- Die Staging-Tabellen `cards_staging` und `foreign_names_staging` entstehen zur Laufzeit aus genau diesen DDL-Dateien. Sie haben deshalb keine eigene Datei.
 
 ## 6. Frontend
 
-Code: [frontend/app.py](frontend/app.py) und [frontend/templates/index.html](frontend/templates/index.html), ausgeliefert als Docker-Container ([frontend/Dockerfile](frontend/Dockerfile)).
+Code: [frontend/app.py](frontend/app.py) und die Templates in [frontend/templates/](frontend/templates/), ausgeliefert als Docker-Container ([frontend/Dockerfile](frontend/Dockerfile)).
 
 - Liest aus der MySQL-Datenbank.
 - Verarbeitet die Nutzereingabe: Suchbegriff und Suchfeld (Kartenname, Kartentext, Artist oder alle drei).
-- Die Namenssuche findet auch übersetzte Namen: "Manta" findet "Manta Riders" und über den deutschen Namen "Wolkenmanta" auch die Karte "Cloud Manta".
-- Zeigt Bild, Name, Typ, Set, Text, Artist und ID (Multiverse-ID), 50 Treffer pro Seite.
-- Die Suche ist eine Teilstring-Suche (`LIKE %begriff%`) mit gebundenen Parametern.
+- Erfüllt das Beispiel aus der Aufgabenstellung: "Manta" findet "Manta Riders" und über den deutschen Namen "Wolkenmanta" auch die Karte "Cloud Manta". Namen in allen anderen Sprachen werden über `foreign_names` mitgesucht.
+- Die Suche ignoriert Groß-/Kleinschreibung, Akzente und `ß`/`ss` (normalisierte Spalten `search_name`/`search_all`).
+- Trefferliste mit Bild, Name, deutschem Namen, Typ, Farben, Set, Text, Artist und ID (Multiverse-ID), 50 Treffer pro Seite.
+- Detailseite pro Karte (`/card/<id>`): alle Attribute, alle Übersetzungen und Links zu den anderen Drucken derselben Karte.
+- Die Suche ist eine Teilstring-Suche (`LIKE %begriff%`) mit gebundenen Parametern (kein SQL-Injection-Risiko), die Eingabe ist auf 100 Zeichen begrenzt.
 
 Aufruf: `http://<VM-IP>:5000/`
+
+![Suche nach "Manta" im Kartennamen: Cloud Manta / Wolkenmanta wie im Beispiel der Aufgabenstellung](docs/frontend_manta.png)
 
 ## 7. Installation und Betrieb
 
@@ -134,7 +193,7 @@ Das Skript startet MySQL und das Frontend, installiert `pymysql` und den MySQL-J
 | Skript | Zweck |
 |---|---|
 | [setup/setup_vm.sh](setup/setup_vm.sh) | Einmalige Einrichtung (siehe oben). |
-| [setup/deploy.sh](setup/deploy.sh) | Kopiert DAG, Skripte und DDLs erneut in den Airflow-Container. |
+| [setup/deploy.sh](setup/deploy.sh) | Kopiert DAG, Skripte und DDLs erneut in den Airflow-Container und legt dort `mtg_mysql.env` an (ohne Root-Passwort). |
 | [setup/start_services.sh](setup/start_services.sh) | Startet nach einem VM-Neustart Container, Hadoop und HiveServer2. |
 | [setup/dag_status.sh](setup/dag_status.sh) | Zeigt den Status der DAG-Läufe und Tasks (im Airflow-Container ausführen). |
 
